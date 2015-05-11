@@ -47,10 +47,14 @@ func InitializeMapFunc(c *Call) (MapFunc, error) {
 		return nil, fmt.Errorf("expected one argument for %s()", c.Name)
 	}
 
-	// Ensure the argument is a variable reference.
-	_, ok := c.Args[0].(*VarRef)
-	if !ok {
-		return nil, fmt.Errorf("expected field argument in %s()", c.Name)
+	// derivative can take a nested aggregate function, everything else expects
+	// a variable reference as the first arg
+	if c.Name != "derivative" {
+		// Ensure the argument is a variable reference.
+		_, ok := c.Args[0].(*VarRef)
+		if !ok {
+			return nil, fmt.Errorf("expected field argument in %s()", c.Name)
+		}
 	}
 
 	// Retrieve map function by name.
@@ -79,6 +83,17 @@ func InitializeMapFunc(c *Call) (MapFunc, error) {
 		_, ok := c.Args[1].(*NumberLiteral)
 		if !ok {
 			return nil, fmt.Errorf("expected float argument in percentile()")
+		}
+		return MapEcho, nil
+	case "derivative":
+		if len(c.Args) == 0 {
+			return nil, fmt.Errorf("expected argument in derivative()")
+		}
+
+		// If the arg is another aggregate e.g. derivative(mean(value)), then
+		// use the map func for that nested aggregate
+		if fn, ok := c.Args[0].(*Call); ok {
+			return InitializeMapFunc(fn)
 		}
 		return MapEcho, nil
 	default:
@@ -120,6 +135,8 @@ func InitializeReduceFunc(c *Call) (ReduceFunc, error) {
 			return nil, fmt.Errorf("expected float argument in percentile()")
 		}
 		return ReducePercentile(lit.Val), nil
+	case "derivative":
+		return ReduceDerivative, nil
 	default:
 		return nil, fmt.Errorf("function not found: %q", c.Name)
 	}
@@ -239,6 +256,61 @@ func MapMean(itr Iterator) interface{} {
 	}
 
 	return nil
+}
+
+// ReduceDerivative computes the derivative of the values
+func ReduceDerivative(values []interface{}) interface{} {
+	// No values to reduce should return no derivative
+	if len(values) == 0 {
+		return nil
+	}
+
+	// Track the first and last points as we iterate over the values
+	var first, last, lastSeen float64
+	var seenFirst bool
+	count := 0
+
+	for _, v := range values {
+		if v == nil {
+			continue
+		}
+
+		switch c := v.(type) {
+
+		// Nested aggregates output a slice of floats
+		case []interface{}:
+			for _, v := range c {
+				lastSeen = v.(float64)
+				if !seenFirst {
+					first = lastSeen
+					seenFirst = true
+				}
+				count++
+			}
+
+			// Nested mean aggregates output special output
+		case *meanMapOutput:
+			lastSeen = c.Mean
+			if !seenFirst {
+				first = lastSeen
+				seenFirst = true
+			}
+			count++
+		default:
+			panic("unexpected type " + fmt.Sprintf("%#v", c) + " for reduce derivative")
+		}
+	}
+
+	// Record the last value
+	last = lastSeen
+
+	// If not values were seen, skip the derivative
+	if count == 0 {
+		return nil
+	}
+
+	// Compute the derivative as the slope of the line between the first and last values
+	return (last - first) / float64(count)
 }
 
 type meanMapOutput struct {
